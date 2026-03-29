@@ -1,6 +1,5 @@
 # code/exp2_prostate_hd95_heatmap.py
 # 实验题2：baseline / dropout / l2 的测试集HD95趋势 + 同一样本边界误差热力图
-# 说明：尽量复用现有代码（viz_eval.py），这里只补“case级划分 + HD95/热力图计算”
 
 import os, argparse, random
 import numpy as np
