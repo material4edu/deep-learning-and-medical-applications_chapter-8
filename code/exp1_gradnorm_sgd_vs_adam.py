@@ -1,7 +1,5 @@
 # exp1_gradnorm_sgd_vs_adam.py
 # 实验题1：绘制前10个epoch的“权重梯度L2范数”曲线，并结合训练集Dice波动进行对比
-# 说明：尽量复用 train_spleen_opt.py 的模型/数据集/损失与Dice实现，仅新增记录与绘图逻辑
-
 import os
 import argparse
 import random
