@@ -1,6 +1,8 @@
-python code/viz_eval.py ^
-  --data data/Task09_Spleen ^
-  --weights data/models/spleen_baseline.pth ^
+@echo off
+python "%~dp0code/viz_eval.py" ^
+  --data "%~dp0data/Task09_Spleen" ^
+  --weights "%~dp0data/models/spleen_baseline.pth" ^
+  --normalization zscore ^
   --split Tr ^
   --base 32 ^
-  --outdir data/reports/spleen_viz_eval ^
+  --outdir "%~dp0data/reports/spleen_viz_eval"

@@ -1,4 +1,6 @@
 import os, glob, argparse
+import json
+from pathlib import Path
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -62,6 +64,7 @@ def load_nii(path: str) -> np.ndarray:
 
 
 def zscore_volume(vol: np.ndarray) -> np.ndarray:
+    """Apply the volume normalization used by the baseline models."""
     vol = vol.astype(np.float32)
     m = float(vol.mean())
     s = float(vol.std()) + 1e-6
@@ -146,7 +149,8 @@ def find_best_slice(gt3d_256: np.ndarray) -> int:
 
 
 def mask_to_contour(mask2d: np.ndarray, thickness: int = 2) -> np.ndarray:
-    m = (mask2d > 0).astype(np.uint8)
+    """Extract external contours from contiguous or reoriented binary masks."""
+    m = np.ascontiguousarray(mask2d > 0, dtype=np.uint8)
     if m.sum() == 0:
         return np.zeros_like(m, dtype=np.uint8)
     contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -178,32 +182,105 @@ def build_gt_256(gt3d: np.ndarray) -> np.ndarray:
     return np.stack(outs, axis=2)
 
 
-def save_triplet(ct_norm, pred2d, gt_contour, out_path, title_prefix=""):
-    # Panel 1: CT
-    # Panel 2: CT + Pred(mask)
-    # Panel 3: CT + Pred(mask) + GT(contour)
+def prepare_case_slice(root, split, case_id, slice_index, net,
+                       normalization, threshold=0.5, device="cpu"):
+    """Predict one native axial slice and align display layers using its affine."""
+    if normalization not in ("zscore", "ct_window"):
+        raise ValueError("Normalization must be zscore or ct_window.")
+    if not 0.0 < threshold < 1.0:
+        raise ValueError("Prediction threshold must be between zero and one.")
+    metadata = json.loads((Path(root) / "dataset.json").read_text(encoding="utf-8"))
+    modality = metadata["modality"]["0"]
+    if normalization == "ct_window" and modality != "CT":
+        raise ValueError("CT window normalization requires CT data.")
+    image_path, label_path = find_case_paths(root, split, case_id)
+    image = nib.load(image_path)
+    axes = nib.aff2axcodes(image.affine)
+    if axes[2] not in ("S", "I"):
+        raise ValueError("This axial slice model requires an axial source volume.")
+    raw = np.asarray(image.dataobj, dtype=np.float32)
+    if raw.ndim == 4:
+        raw = raw[..., 0]
+    if raw.ndim != 3:
+        raise ValueError("Expected a 3D image after selecting the first modality.")
+    label = None
+    gt_256 = None
+    if label_path is not None:
+        label_image = nib.load(label_path)
+        if label_image.shape != raw.shape or not np.allclose(label_image.affine, image.affine):
+            raise ValueError("Image and annotation must share the same spatial grid.")
+        label = np.asarray(label_image.dataobj)
+        gt_256 = build_gt_256(label)
+    z = slice_index
+    if z < 0:
+        z = find_best_slice(gt_256) if gt_256 is not None else raw.shape[2] // 2
+    if not 0 <= z < raw.shape[2]:
+        raise ValueError("Slice index is outside the source volume.")
+
+    if normalization == "zscore":
+        model_volume = zscore_volume(raw)
+    else:
+        # Match train_spleen_opt.py: map [-100, 400] HU to [0, 1].
+        model_volume = np.clip((raw + 100.0) / 500.0, 0.0, 1.0)
+    prediction = predict_volume_slicewise(
+        net, model_volume[:, :, z:z + 1], thr=threshold, device=device,
+    )[:, :, 0]
+    background = cv2.resize(raw[:, :, z], (256, 256))
+    if modality == "CT":
+        background = np.clip((background + 100.0) / 500.0, 0.0, 1.0)
+    else:
+        background = normalize_bg(background)
+
+    # Rows run anterior-to-posterior; columns run patient-right-to-left.
+    # Reorient every display layer identically after native-grid inference.
+    orientation = nib.orientations.ornt_transform(
+        nib.orientations.io_orientation(image.affine),
+        nib.orientations.axcodes2ornt(("P", "L", "S")),
+    )
+    background = nib.orientations.apply_orientation(background[:, :, None], orientation)[:, :, 0]
+    prediction = nib.orientations.apply_orientation(prediction[:, :, None], orientation)[:, :, 0]
+    target = None
+    contour = None
+    if gt_256 is not None:
+        target = nib.orientations.apply_orientation(gt_256[:, :, z:z + 1], orientation)[:, :, 0]
+        contour = mask_to_contour(target, thickness=2)
+    scaled_spacing = np.asarray(image.header.get_zooms()[:3], dtype=float)
+    scaled_spacing[:2] *= np.asarray(raw.shape[:2]) / 256.0
+    display_spacing = scaled_spacing[np.argsort(orientation[:, 0])]
+    return {
+        "background": background, "prediction": prediction,
+        "target": target, "contour": contour,
+        "aspect": float(display_spacing[0] / display_spacing[1]),
+        "slice": int(z), "modality": modality,
+        "source_shape": list(raw.shape), "source_axes": list(axes),
+        "label_values": np.unique(label).tolist() if label is not None else [],
+    }
+
+
+def save_triplet(ct_norm, pred2d, gt_contour, out_path, title_prefix="", aspect=1.0):
+    """Save neutral titles, a green prediction, and a red annotation contour."""
     pred_rgba = np.zeros((ct_norm.shape[0], ct_norm.shape[1], 4), dtype=np.float32)
-    pred_rgba[..., 0] = 1.0
+    pred_rgba[..., 1] = 1.0
     pred_rgba[..., 3] = 0.35 * pred2d
 
     gt_rgba = np.zeros((ct_norm.shape[0], ct_norm.shape[1], 4), dtype=np.float32)
-    gt_rgba[..., 1] = 1.0
+    gt_rgba[..., 0] = 1.0
     gt_rgba[..., 3] = 0.95 * gt_contour
 
     fig, axes = plt.subplots(1, 3, figsize=(13, 4))
-    axes[0].imshow(ct_norm, cmap="gray")
-    axes[0].set_title(f"{title_prefix}CT".strip(), fontsize=12)
+    axes[0].imshow(ct_norm, cmap="gray", vmin=0.0, vmax=1.0, aspect=aspect)
+    axes[0].set_title(f"{title_prefix}a. \u539f\u59cb\u56fe\u50cf".strip(), fontsize=12)
     axes[0].axis("off")
 
-    axes[1].imshow(ct_norm, cmap="gray")
-    axes[1].imshow(pred_rgba)
-    axes[1].set_title(f"{title_prefix}CT + 预测掩膜".strip(), fontsize=12)
+    axes[1].imshow(ct_norm, cmap="gray", vmin=0.0, vmax=1.0, aspect=aspect)
+    axes[1].imshow(pred_rgba, interpolation="nearest", aspect=aspect)
+    axes[1].set_title(f"{title_prefix}b. \u539f\u59cb\u56fe\u50cf + \u9884\u6d4b\u63a9\u819c".strip(), fontsize=12)
     axes[1].axis("off")
 
-    axes[2].imshow(ct_norm, cmap="gray")
-    axes[2].imshow(pred_rgba)
-    axes[2].imshow(gt_rgba)
-    axes[2].set_title(f"{title_prefix}CT + 预测掩膜 + 标注轮廓".strip(), fontsize=12)
+    axes[2].imshow(ct_norm, cmap="gray", vmin=0.0, vmax=1.0, aspect=aspect)
+    axes[2].imshow(pred_rgba, interpolation="nearest", aspect=aspect)
+    axes[2].imshow(gt_rgba, interpolation="nearest", aspect=aspect)
+    axes[2].set_title(f"{title_prefix}c. \u539f\u59cb\u56fe\u50cf + \u9884\u6d4b\u63a9\u819c + \u6807\u6ce8\u8f6e\u5ed3".strip(), fontsize=12)
     axes[2].axis("off")
 
     plt.tight_layout()
@@ -211,21 +288,20 @@ def save_triplet(ct_norm, pred2d, gt_contour, out_path, title_prefix=""):
     plt.close()
 
 
-def save_double(ct_norm, pred2d, out_path, title_prefix=""):
-    # Panel 1: CT
-    # Panel 2: CT + Pred(mask)
+def save_double(ct_norm, pred2d, out_path, title_prefix="", aspect=1.0):
+    """Save neutral image and prediction panels using a green overlay."""
     pred_rgba = np.zeros((ct_norm.shape[0], ct_norm.shape[1], 4), dtype=np.float32)
-    pred_rgba[..., 0] = 1.0
+    pred_rgba[..., 1] = 1.0
     pred_rgba[..., 3] = 0.35 * pred2d
 
     fig, axes = plt.subplots(1, 2, figsize=(9, 4))
-    axes[0].imshow(ct_norm, cmap="gray")
-    axes[0].set_title(f"{title_prefix}CT".strip(), fontsize=12)
+    axes[0].imshow(ct_norm, cmap="gray", vmin=0.0, vmax=1.0, aspect=aspect)
+    axes[0].set_title(f"{title_prefix}a. \u539f\u59cb\u56fe\u50cf".strip(), fontsize=12)
     axes[0].axis("off")
 
-    axes[1].imshow(ct_norm, cmap="gray")
-    axes[1].imshow(pred_rgba)
-    axes[1].set_title(f"{title_prefix}CT + Pred(mask)".strip(), fontsize=12)
+    axes[1].imshow(ct_norm, cmap="gray", vmin=0.0, vmax=1.0, aspect=aspect)
+    axes[1].imshow(pred_rgba, interpolation="nearest", aspect=aspect)
+    axes[1].set_title(f"{title_prefix}b. \u539f\u59cb\u56fe\u50cf + \u9884\u6d4b\u63a9\u819c".strip(), fontsize=12)
     axes[1].axis("off")
 
     plt.tight_layout()
@@ -234,9 +310,12 @@ def save_double(ct_norm, pred2d, out_path, title_prefix=""):
 
 
 def main():
+    """Render one verified case with explicitly selected model normalization."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True, help="Path to Task05_Prostate or Task09_Spleen")
     ap.add_argument("--weights", required=True, help="Path to model .pth")
+    ap.add_argument("--normalization", required=True, choices=["zscore", "ct_window"],
+                    help="Training input: baseline uses zscore; spleen optimizer training uses ct_window")
     ap.add_argument("--split", default="Tr", choices=["Tr", "Ts"], help="Use imagesTr or imagesTs")
     ap.add_argument("--case", default="", help="Case id like prostate_16 or spleen_6; empty => auto pick (Tr only)")
     ap.add_argument("--slice", type=int, default=-1, help="Slice index z; -1 => auto pick")
@@ -250,8 +329,8 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     net = UNetMini(base=args.base, p_drop=0.0).to(device)
-    state = torch.load(args.weights, map_location=device)
-    net.load_state_dict(state, strict=False)
+    state = torch.load(args.weights, map_location=device, weights_only=True)
+    net.load_state_dict(state, strict=True)
 
     # Determine case id
     if args.case.strip() == "":
@@ -261,50 +340,31 @@ def main():
     else:
         case_id = args.case.strip()
 
-    img_path, lab_path = find_case_paths(args.data, args.split, case_id)
-
-    img = load_nii(img_path).astype(np.float32)
-    if img.ndim == 4:
-        img = img[..., 0]
-
-    img_z = zscore_volume(img)
-    pred_256 = predict_volume_slicewise(net, img_z, thr=args.pred_thr, device=device)
-
-    # Determine z slice
-    if lab_path is not None:
-        gt = load_nii(lab_path)
-        gt_256 = build_gt_256(gt)
-        z = args.slice if args.slice >= 0 else find_best_slice(gt_256)
-        gt2d = gt_256[:, :, z].astype(np.uint8)
-        gt_contour = mask_to_contour(gt2d, thickness=2).astype(np.float32)
-    else:
-        z = args.slice if args.slice >= 0 else int(pred_256.shape[2] // 2)
-        gt_contour = None
-
-    # Background CT slice in 256 space
-    ct2d = cv2.resize(img_z[:, :, z].astype(np.float32), (256, 256)).astype(np.float32)
-    ct_norm = normalize_bg(ct2d)
-
-    pred2d = pred_256[:, :, z].astype(np.float32)
+    result = prepare_case_slice(
+        args.data, args.split, case_id, args.slice, net,
+        normalization=args.normalization, threshold=args.pred_thr, device=device,
+    )
+    z = result["slice"]
 
     tag = f"_{args.tag}" if args.tag.strip() else ""
-    if lab_path is not None:
+    if result["contour"] is not None:
         out_name = f"triplet_overlay_{case_id}_z{z}{tag}.png"
         out_path = os.path.join(args.outdir, out_name)
-        save_triplet(ct_norm, pred2d, gt_contour, out_path, title_prefix="")
+        save_triplet(result["background"], result["prediction"], result["contour"],
+                     out_path, aspect=result["aspect"])
     else:
         out_name = f"double_overlay_{case_id}_z{z}{tag}.png"
         out_path = os.path.join(args.outdir, out_name)
-        save_double(ct_norm, pred2d, out_path, title_prefix="")
+        save_double(result["background"], result["prediction"], out_path,
+                    aspect=result["aspect"])
 
     print("[OK] split:", args.split)
     print("[OK] case:", case_id)
     print("[OK] z:", z)
-    print("[OK] image:", os.path.abspath(img_path))
-    if lab_path is not None:
-        print("[OK] label:", os.path.abspath(lab_path))
-    print("[OK] weights:", os.path.abspath(args.weights))
-    print("[OK] saved:", os.path.abspath(out_path))
+    print("[OK] modality:", result["modality"])
+    print("[OK] normalization:", args.normalization)
+    print("[OK] weights:", Path(args.weights).name)
+    print("[OK] saved:", Path(out_path).name)
 
 
 if __name__ == "__main__":
